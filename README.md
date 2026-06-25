@@ -118,10 +118,10 @@ Real output from
 `python extract_confidence_traces.py --model_name "Qwen/Qwen3-8B" --dataset gpqa --limit 5 --max_prompt_tokens 16384 --max_chunks 60 --run_dir runs/gpqa`
 (a GPQA physics question — `⟨10σ_z + 5σ_x⟩` for a spin-½ superposition).
 
-This is a textbook **confidence leap**: the model commits to the wrong answer
-`A` for three chunks, then at chunk 3 — which literally opens with the trigger
-word *"Wait"* — it rechecks the algebra and `P(correct=B)` jumps from `0.318`
-to `0.985`, after which it stays certain. The probability trajectory:
+This example shows a **confidence leap**: the model commits to the wrong answer
+`A` for three chunks, then at chunk 3 — which opens with the trigger word
+*"Wait"* — it rechecks the algebra and `P(correct=B)` jumps from `0.318` to
+`0.985`, after which it stays certain. The probability trajectory:
 
 ```
 chunk:          0     1     2     3     4     5     …     21
