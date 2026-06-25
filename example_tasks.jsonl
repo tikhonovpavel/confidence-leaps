@@ -1,0 +1,3 @@
+{"question": "Find the root of the equation 2x + 6 = 0.", "choices": ["-3", "3", "-6", "12"], "correct_letter": "A"}
+{"question": "Find the positive root of the equation x^2 - 9 = 0.", "choices": ["1", "3", "9", "-3"], "correct_letter": "B"}
+{"question": "Find the root of the equation 5x - 20 = 0.", "choices": ["-4", "5", "4", "100"], "correct_letter": "C"}

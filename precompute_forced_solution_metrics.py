@@ -1,0 +1,762 @@
+import json
+import logging
+import re
+import fire
+import sqlite3
+
+import sys
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Iterable, List, Optional, Dict, Tuple
+
+import torch
+from tqdm.auto import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from rc_utils import (
+    QWEN3_SPECIAL_STOPPING_PROMPT,
+    split_reasoning_chain,
+    extract_think_content,
+    compose_user_prompt,
+)
+
+
+# ----------------------------------------------------------------------------
+# Logging
+# ----------------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+
+# ----------------------------------------------------------------------------
+# Constants & Types
+# ----------------------------------------------------------------------------
+# moved to rc_utils
+
+
+@dataclass
+class RowItem:
+    id: int
+    model_path: str
+    question_id: Optional[str]
+    question_text: str
+    choices: str
+    correct_answer_letter: Optional[str]
+    full_prompt_text: str
+
+
+# ----------------------------------------------------------------------------
+# DB Access
+# ----------------------------------------------------------------------------
+def ensure_metrics_table(conn: sqlite3.Connection):
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS reasoning_trace_forced_solution_metrics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_table TEXT NOT NULL,
+            trace_id INTEGER NOT NULL,
+            model_path TEXT NOT NULL,
+            model_name TEXT NOT NULL,
+            system_prompt TEXT NOT NULL,
+            num_chunks INTEGER NOT NULL,
+            predictions_json TEXT NOT NULL,
+            continuation_texts_json TEXT NOT NULL DEFAULT '[]',
+            token_confidences_json TEXT NOT NULL DEFAULT '[]',
+            letter_probs_json TEXT NOT NULL DEFAULT '[]',
+            first_prediction_index INTEGER,
+            first_correct_index INTEGER,
+            stabilized_index INTEGER,
+            stabilized_value TEXT,
+            num_changes INTEGER NOT NULL,
+            correct_at_first_chunk INTEGER NOT NULL,
+            overall_correct INTEGER NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(source_table, trace_id, model_path, model_name, system_prompt)
+        )
+        """
+    )
+    conn.commit()
+
+
+def fetch_rows(
+    conn: sqlite3.Connection,
+    source_table_name: str,
+    where_model_path: Optional[str],
+    limit: Optional[int],
+    offset: int,
+) -> List[RowItem]:
+    cur = conn.cursor()
+    params: List[object] = []
+    where_clause = ""
+    if where_model_path:
+        where_clause = "WHERE LOWER(model_path) = LOWER(?)"
+        params.append(where_model_path)
+    sql = f"""
+        SELECT id, model_path, question_id, question_text, choices, correct_answer_letter,
+               full_prompt_text
+        FROM {source_table_name}
+        {where_clause}
+        ORDER BY id ASC
+        LIMIT {limit if limit is not None else -1} OFFSET {offset}
+    """
+    cur.execute(sql, params)
+    rows: List[RowItem] = []
+    for r in cur.fetchall():
+        rows.append(
+            RowItem(
+                id=r[0],
+                model_path=r[1],
+                question_id=r[2],
+                question_text=r[3] or "",
+                choices=r[4] or "",
+                correct_answer_letter=(r[5] or "").strip() or None,
+                full_prompt_text=r[6] or "",
+            )
+        )
+    return rows
+
+
+def has_existing_metrics(
+    conn: sqlite3.Connection, source_table: str, trace_id: int, model_path: str, model_name: str, system_prompt: str
+) -> bool:
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT 1 FROM reasoning_trace_forced_solution_metrics
+        WHERE source_table = ? AND trace_id = ? AND LOWER(model_path) = LOWER(?) AND LOWER(model_name) = LOWER(?) AND system_prompt = ?
+        LIMIT 1
+        """,
+        (source_table, trace_id, model_path, model_name, system_prompt),
+    )
+    return cur.fetchone() is not None
+
+
+def upsert_metrics(
+    conn: sqlite3.Connection,
+    *,
+    source_table: str,
+    trace_id: int,
+    model_path: str,
+    model_name: str,
+    system_prompt: str,
+    num_chunks: int,
+    predictions: List[Optional[str]],
+    continuation_texts: List[str],
+    token_confidences: List[List[float]],
+    letter_probs: List[Dict[str, float]],
+    first_prediction_index: Optional[int],
+    first_correct_index: Optional[int],
+    stabilized_index: Optional[int],
+    stabilized_value: Optional[str],
+    num_changes: int,
+    correct_at_first_chunk: bool,
+    overall_correct: bool,
+):
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO reasoning_trace_forced_solution_metrics (
+            source_table, trace_id, model_path, model_name, system_prompt, num_chunks, predictions_json,
+            continuation_texts_json, token_confidences_json,
+            letter_probs_json,
+            first_prediction_index, first_correct_index, stabilized_index, stabilized_value,
+            num_changes, correct_at_first_chunk, overall_correct, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(source_table, trace_id, model_path, model_name, system_prompt)
+        DO UPDATE SET
+            num_chunks = excluded.num_chunks,
+            predictions_json = excluded.predictions_json,
+            continuation_texts_json = excluded.continuation_texts_json,
+            token_confidences_json = excluded.token_confidences_json,
+            letter_probs_json = excluded.letter_probs_json,
+            first_prediction_index = excluded.first_prediction_index,
+            first_correct_index = excluded.first_correct_index,
+            stabilized_index = excluded.stabilized_index,
+            stabilized_value = excluded.stabilized_value,
+            num_changes = excluded.num_changes,
+            correct_at_first_chunk = excluded.correct_at_first_chunk,
+            overall_correct = excluded.overall_correct,
+            created_at = excluded.created_at
+        """,
+        (
+            source_table,
+            trace_id,
+            model_path,
+            model_name,
+            system_prompt,
+            num_chunks,
+            json.dumps(predictions),
+            json.dumps(continuation_texts),
+            json.dumps(token_confidences),
+            json.dumps(letter_probs),
+            first_prediction_index,
+            first_correct_index,
+            stabilized_index,
+            stabilized_value,
+            num_changes,
+            1 if correct_at_first_chunk else 0,
+            1 if overall_correct else 0,
+            datetime.utcnow().isoformat(timespec="seconds"),
+        ),
+    )
+    conn.commit()
+
+
+def update_letter_probs_only(
+    conn: sqlite3.Connection,
+    *,
+    source_table: str,
+    trace_id: int,
+    model_path: str,
+    model_name: str,
+    system_prompt: str,
+    letter_probs: List[Dict[str, float]],
+):
+    """Efficiently update only the letter_probs_json column for a given trace."""
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE reasoning_trace_forced_solution_metrics
+        SET letter_probs_json = ?
+        WHERE source_table = ? AND trace_id = ? AND LOWER(model_path) = LOWER(?) AND LOWER(model_name) = LOWER(?) AND system_prompt = ?
+        """,
+        (
+            json.dumps(letter_probs),
+            source_table,
+            trace_id,
+            model_path,
+            model_name,
+            system_prompt,
+        ),
+    )
+    conn.commit()
+
+
+# ----------------------------------------------------------------------------
+# Text Utilities are imported from rc_utils
+# ----------------------------------------------------------------------------
+def extract_think_content_for_row(row: RowItem) -> Optional[str]:
+    """Extracts reasoning/think content based on the model path."""
+    # model_path can be None in some database schemas
+    model_path = row.model_path or ""
+    if 'gpt-oss' in model_path.lower():
+        # OSS models (20b, 120b, etc) use <|start|>analysis<|message|>...<|end|>
+        match = re.search(r"<\|start\|>analysis<\|message\|>(.*?)(<\|end\|>)", row.full_prompt_text, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+        return None
+    else:
+        # Default to Qwen/Deepseek <think>...</think>
+        return extract_think_content(row.full_prompt_text)
+
+
+# ----------------------------------------------------------------------------
+# Model Wrapper
+# ----------------------------------------------------------------------------
+class ModelForcing:
+    def __init__(self, model_name: str, device_map: str = "auto", init_model: bool = True):
+        logger.info("Loading model: %s", model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+
+        # self.model_name = model_name
+        # self.model = None
+        
+        if init_model:
+            # For large models, use device_map="auto" to automatically distribute across GPUs
+            # Note: On A100, MXFP4 will be emulated or dequantized to bf16
+            _dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+            try:
+                # Newer transformers use `dtype`; older ones use `torch_dtype`.
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    device_map=device_map,
+                    dtype=_dtype,
+                )
+            except TypeError:
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    device_map=device_map,
+                    torch_dtype=_dtype,
+                )
+            if self.model.config.pad_token_id is None:
+                self.model.config.pad_token_id = self.tokenizer.pad_token_id
+
+            self.device = self.model.device
+            logger.info("Model loaded")
+
+        self.model_name = model_name
+
+        # Precompute candidate token ids for letters A..D
+        self.letter_to_token_ids: Dict[str, List[int]] = {}
+        for letter in ["A", "B", "C", "D"]:
+            variants = [letter, f" {letter}"]
+            ids: List[int] = []
+            for v in variants:
+                enc = self.tokenizer.encode(v, add_special_tokens=False)
+                if len(enc) == 1:
+                    ids.append(enc[0])
+            # Deduplicate
+            ids = list(dict.fromkeys(ids))
+            self.letter_to_token_ids[letter] = ids
+
+    @torch.no_grad()
+    def forced_solution(
+        self,
+        prompt_text: str,
+        think_content: str,
+        system_prompt: Optional[str],
+        max_new_tokens: int = 20,
+    ) -> Optional[tuple[str, List[float]]]:
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt_text})
+
+        header = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+        if 'gpt-oss' in self.model_name.lower():
+            templated = header + f"<|start|>analysis<|message|>{think_content}<|end|><|start|>final<|message|>"
+        elif 'qwq' in self.model_name.lower():
+            # For QwQ: header already contains "<think>\n" from add_generation_prompt=True
+            # So we just append the think_content directly
+            templated = header + f"{think_content}{QWEN3_SPECIAL_STOPPING_PROMPT}"
+        else:
+            # Default logic for Qwen3/Deepseek (they don't auto-add <think>)
+            templated = header + f"<think>\n{think_content}{QWEN3_SPECIAL_STOPPING_PROMPT}"
+            if "deepseek" in self.model_name.lower():
+                templated = templated.replace(
+                    '<think>\n<think>', '<think>'
+                )
+
+        inputs = self.tokenizer(templated, return_tensors="pt").to(self.device)
+        gen_out = self.model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            temperature=1.0,
+            top_p=1.0,
+            output_scores=True,
+            return_dict_in_generate=True,
+        )
+        output_ids = gen_out.sequences
+        scores = gen_out.scores or []
+        prompt_len = inputs["input_ids"].shape[1]
+        new_ids = output_ids[0, prompt_len:]
+        continuation = self.tokenizer.decode(new_ids, skip_special_tokens=True).strip()
+
+        # Compute per-token confidences (softmax prob for chosen token at each step)
+        token_probs: List[float] = []
+        for t, logits in enumerate(scores):
+            probs = torch.nn.functional.softmax(logits[0], dim=-1)
+            tok_id = new_ids[t].item()
+            prob = probs[tok_id].detach().float().item()
+            token_probs.append(float(prob))
+
+        return continuation, token_probs
+
+    @torch.no_grad()
+    def letter_probs_first_nonspace(
+        self,
+        system_prompt: Optional[str],
+        user_prompt: str,
+        think_prefix: str,
+        whitespace_topk: int = 1,
+        topk_probe: int = 50,
+    ) -> Dict[str, float]:
+        """Probability for A..D at the first non-whitespace position after </think>.
+
+        Approximates P(letter) = P(letter at t0) + Σ_{s in top-K whitespace} P(s at t0) * P(letter at t1 | s).
+        """
+        templated = self._prepare_templated_prompt(system_prompt, user_prompt, think_prefix)
+
+        inputs = self.tokenizer(templated, return_tensors="pt").to(self.device)
+        try:
+            outputs = self.model(**inputs)
+        except torch.OutOfMemoryError as e:
+            num_tokens = inputs["input_ids"].shape[1]
+            logger.error(
+                f"CUDA OOM when processing input with {num_tokens} tokens (text length: {len(templated)} chars)."
+            )
+            raise e
+        logits = outputs.logits  # [1, seq_len, vocab]
+        next_logits = logits[0, -1]
+        probs = torch.softmax(next_logits.float(), dim=-1)
+
+        # Direct contribution at t0
+        direct: Dict[str, float] = {}
+        for letter, ids in self.letter_to_token_ids.items():
+            if not ids:
+                direct[letter] = 0.0
+                continue
+            direct[letter] = max(float(probs[i].item()) for i in ids)
+
+        # # Identify whitespace candidates among top-K next tokens
+        # top_vals, top_ids = torch.topk(probs, k=min(topk_probe, probs.shape[-1]))
+        # whitespace_ids: List[Tuple[int, float]] = []
+        # for val, tid in zip(top_vals.tolist(), top_ids.tolist()):
+        #     text = self.tokenizer.decode([tid])
+        #     if text != "" and text.isspace():
+        #         whitespace_ids.append((tid, float(val)))
+        #     if len(whitespace_ids) >= whitespace_topk:
+        #         break
+        #
+        # # Marginalize over whitespace candidates
+        # contrib = {"A": 0.0, "B": 0.0, "C": 0.0, "D": 0.0}
+        # if whitespace_ids:
+        #     base_ids = inputs["input_ids"]
+        #     for tid, p_s in whitespace_ids:
+        #         new_id_tensor = torch.tensor([[tid]], dtype=base_ids.dtype, device=self.device)
+        #         concat = torch.cat([base_ids, new_id_tensor], dim=1)
+        #         attn = torch.ones_like(concat)
+        #         out2 = self.model(input_ids=concat, attention_mask=attn)
+        #         logits2 = out2.logits[0, -1]
+        #         probs2 = torch.softmax(logits2.float(), dim=-1)
+        #         for letter, ids in self.letter_to_token_ids.items():
+        #             if not ids:
+        #                 continue
+        #             p2 = max(float(probs2[i].item()) for i in ids)
+        #             contrib[letter] += p_s * p2
+        #
+        # out = {}
+        # for letter in ["A", "B", "C", "D"]:
+        #     out[letter] = min(1.0, direct.get(letter, 0.0) + contrib.get(letter, 0.0))
+        # return out
+        return direct
+
+    def _prepare_templated_prompt(
+        self, system_prompt: Optional[str], user_prompt: str, think_prefix: str
+    ) -> str:
+        """Constructs the final model input string with templates and reasoning."""
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": user_prompt})
+        header = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        if 'gpt-oss' in self.model_name.lower():
+            templated = header + f"<|start|>analysis<|message|>{think_prefix}<|end|><|start|>final<|message|>"
+        elif 'qwq' in self.model_name.lower():
+            # For QwQ: header already contains "<think>\n" from add_generation_prompt=True
+            # So we just append the think_prefix directly
+            templated = header + f"{think_prefix}{QWEN3_SPECIAL_STOPPING_PROMPT}"
+        else:
+            # Default logic for Qwen3/Deepseek (they don't auto-add <think>)
+            templated = header + f"<think>\n{think_prefix}{QWEN3_SPECIAL_STOPPING_PROMPT}"
+            if "deepseek" in self.model_name.lower():
+                templated = templated.replace(
+                    '<think>\n<think>', '<think>'
+                )
+
+        templated += '\\boxed{'
+        return templated
+
+
+LETTER_RE = re.compile(r"\b([A-Da-d])\b")
+
+
+def extract_letter(text: Optional[str]) -> Optional[str]:
+    if not text:
+        return None
+    m = LETTER_RE.search(text)
+    if not m:
+        return None
+    return m.group(1).upper()
+
+
+def compute_predictions_per_prefix(
+    forcing: ModelForcing,
+    prompt_text: str,
+    chunks: List[str],
+    system_prompt: Optional[str],
+    max_new_tokens: int,
+) -> tuple[List[Optional[str]], List[str], List[List[float]], List[Dict[str, float]]]:
+    predictions: List[Optional[str]] = []
+    continuations: List[str] = []
+    confidences: List[List[float]] = []
+    letter_probs: List[Dict[str, float]] = []
+    for i in range(len(chunks)):
+        think_prefix = "\n\n".join(chunks[: i + 1])
+        # forced = forcing.forced_solution(prompt_text, think_prefix, system_prompt, max_new_tokens)
+        # if forced is None:
+        #     continuations.append("")
+        #     confidences.append([])
+        #     predictions.append(None)
+        #     letter_probs.append({})
+        #     continue
+        # cont_text, token_probs = forced
+        # letter = extract_letter(cont_text)
+        # predictions.append(letter)
+        # continuations.append(cont_text)
+        # confidences.append(token_probs)
+
+        # Per user request, continuation generation is disabled.
+        # Instead, we derive predictions by taking the argmax of letter probabilities.
+        continuations.append("")
+        confidences.append([])
+
+        # Also compute letter probabilities
+        probs = forcing.letter_probs_first_nonspace(system_prompt, prompt_text, think_prefix)
+        letter_probs.append(probs)
+
+        # Derive prediction from argmax of probabilities
+        if probs:
+            prediction = max(probs, key=probs.get)
+            predictions.append(prediction)
+        else:
+            predictions.append(None)
+
+    return predictions, continuations, confidences, letter_probs
+
+
+def compute_letter_probs_only(
+    forcing: ModelForcing,
+    prompt_text: str,
+    chunks: List[str],
+    system_prompt: Optional[str],
+) -> List[Dict[str, float]]:
+    """Efficiently compute only letter probabilities for all prefixes."""
+    letter_probs: List[Dict[str, float]] = []
+    for i in range(len(chunks)):
+        think_prefix = "\n\n".join(chunks[: i + 1])
+        probs = forcing.letter_probs_first_nonspace(system_prompt, prompt_text, think_prefix)
+        letter_probs.append(probs)
+    return letter_probs
+
+
+def compute_metrics(
+    predictions: List[Optional[str]],
+    correct_letter: Optional[str],
+) -> dict:
+    n = len(predictions)
+    first_prediction_index: Optional[int] = None
+    for i, p in enumerate(predictions):
+        if p is not None:
+            first_prediction_index = i
+            break
+
+    first_correct_index: Optional[int] = None
+    if correct_letter:
+        for i, p in enumerate(predictions):
+            if p == correct_letter:
+                first_correct_index = i
+                break
+
+    # Stabilization: earliest s.t. all following equal and not None
+    stabilized_index: Optional[int] = None
+    stabilized_value: Optional[str] = None
+    for s in range(n):
+        val = predictions[s]
+        if val is None:
+            continue
+        ok = True
+        for j in range(s, n):
+            if predictions[j] != val:
+                ok = False
+                break
+        if ok:
+            stabilized_index = s
+            stabilized_value = val
+            break
+
+    num_changes = 0
+    last: Optional[str] = None
+    for p in predictions:
+        if p is None:
+            continue
+        if last is None:
+            last = p
+            continue
+        if p != last:
+            num_changes += 1
+            last = p
+
+    correct_at_first_chunk = bool(n >= 1 and correct_letter and predictions[0] == correct_letter)
+    overall_correct = bool(n >= 1 and correct_letter and predictions[-1] == correct_letter)
+
+    return {
+        "first_prediction_index": first_prediction_index,
+        "first_correct_index": first_correct_index,
+        "stabilized_index": stabilized_index,
+        "stabilized_value": stabilized_value,
+        "num_changes": num_changes,
+        "correct_at_first_chunk": correct_at_first_chunk,
+        "overall_correct": overall_correct,
+    }
+
+
+# ----------------------------------------------------------------------------
+# Fire CLI entrypoint
+# ----------------------------------------------------------------------------
+def run(
+    sqlite_db: str = "reasoning_traces.sqlite",
+    source_table_name: str = "reasoning_traces_gpqa",
+    where_model_path: str = "Qwen/Qwen3-32B",#"openai/gpt-oss-20b", #"deepseek/DeepSeek-R1-Distill-Llama-70B", #"Qwen/Qwen3-32B",
+    model_name: str = "Qwen/Qwen3-32B",#"openai/gpt-oss-20b", #"deepseek-ai/DeepSeek-R1-Distill-Llama-70B", #"Qwen/Qwen3-32B",
+    system_prompt: str = "Answer only with a letter of a correct choice.",
+    limit: Optional[int] = None,
+    offset: int = 0,
+    only_missing_letter_probs: bool = False,
+    only_with_critical_chunk: bool = False,
+    max_new_tokens: int = 20,
+    max_prompt_tokens: int = 8192,
+    fast_backfill: bool = False,
+    device_map: str = "auto",
+    skip_existing: bool = True,
+):
+    """Precompute Forced Solution stability metrics into SQLite.
+
+    Args mirror the former argparse flags. Use underscores in CLI: e.g., --only_missing.
+    """
+
+    print(f"Connecting to database: {sqlite_db}")
+
+    # --- DB Connection and Initial Fetch ---
+    conn = sqlite3.connect(sqlite_db)
+    ensure_metrics_table(conn)
+
+    logger.info("Checking database for rows to process...")
+    rows = fetch_rows(conn, source_table_name, where_model_path, limit, offset)
+
+    if not rows:
+        logger.info("No rows found matching the criteria. Exiting.")
+        return 0
+
+    if skip_existing:
+        initial_count = len(rows)
+        cur = conn.cursor()
+        sql = "SELECT trace_id FROM reasoning_trace_forced_solution_metrics WHERE source_table = ? AND LOWER(model_name) = LOWER(?) AND LOWER(model_path) = LOWER(?) AND system_prompt = ?"
+        params = (source_table_name, model_name, where_model_path, system_prompt)
+        cur.execute(sql, params)
+        processed_ids = {row[0] for row in cur.fetchall()}
+        
+        if processed_ids:
+            logger.info(f"Found {len(processed_ids)} existing metrics. Will skip them.")
+            rows = [row for row in rows if row.id not in processed_ids]
+            logger.info(f"Filtered {initial_count} rows down to {len(rows)} for processing.")
+
+    if not rows:
+        logger.info("No rows to process after filtering for existing metrics. Exiting.")
+        return 0
+
+    # --- Conditional Model Loading ---
+    logger.info(f"{len(rows)} rows found. Now loading model: %s", model_name)
+    forcing = ModelForcing(model_name, device_map=device_map)
+
+    # Note: `model_name` used in DB queries before this point is the one from args.
+    # Now we use `forcing.model_name` which is the canonical one after loading.
+    # This is fine as we use LOWER() for comparison.
+    
+
+    # --- Selective Processing Logic ---
+    # `rows` is already fetched and filtered by `skip_existing`
+    
+    # Filter rows *before* processing, so tqdm shows the correct total.
+    if only_missing_letter_probs or only_with_critical_chunk:
+        initial_count = len(rows)
+        
+        # 1. Get IDs that already have letter_probs filled
+        processed_ids = set()
+        if only_missing_letter_probs:
+            cur = conn.cursor()
+            # Find rows that have actual data, not just empty placeholders like '[{}, {}]'
+            sql = "SELECT trace_id FROM reasoning_trace_forced_solution_metrics WHERE letter_probs_json LIKE '%\"A\"%' AND source_table = ? AND LOWER(model_name) = LOWER(?) AND LOWER(model_path) = LOWER(?) AND system_prompt = ?"
+            params = (source_table_name, forcing.model_name, where_model_path, system_prompt)
+            cur.execute(sql, params)
+            processed_ids = {row[0] for row in cur.fetchall()}
+            logger.info(f"Found {len(processed_ids)} rows with existing letter_probs, will filter them out.")
+
+        # 2. Get IDs that have a "critical chunk" to focus on them if requested
+        critical_ids = set()
+        if only_with_critical_chunk:
+            cur = conn.cursor()
+            # A "critical chunk" exists if the first correct answer was not on the first chunk
+            cur.execute("SELECT trace_id FROM reasoning_trace_forced_solution_metrics WHERE first_correct_index IS NOT NULL AND first_correct_index > 0 AND source_table = ?", (source_table_name,))
+            critical_ids = {row[0] for row in cur.fetchall()}
+            logger.info(f"Found {len(critical_ids)} rows with a critical chunk. Filtering to process only these.")
+
+        # Apply filters
+        original_rows = rows
+        rows = []
+        for row in original_rows:
+            if only_missing_letter_probs and row.id in processed_ids:
+                continue
+            if only_with_critical_chunk and row.id not in critical_ids:
+                continue
+            rows.append(row)
+        
+        logger.info(f"Filtered {initial_count} rows down to {len(rows)} for processing.")
+
+
+    for row in tqdm(rows, desc="Processing traces"):
+        # Filters have already been applied above
+        think = extract_think_content_for_row(row)
+        if not think:
+            raise ValueError(f"Row {row.id} has no think content.")
+        
+        prompt_text = compose_user_prompt(row.question_text, row.choices)
+        full_templated_prompt = forcing._prepare_templated_prompt(system_prompt, prompt_text, think)
+        num_tokens = len(forcing.tokenizer.encode(full_templated_prompt))
+        if num_tokens > max_prompt_tokens:
+            logger.warning(
+                f"Skipping trace {row.id} due to long prompt ({num_tokens} tokens > {max_prompt_tokens})."
+            )
+            continue
+        
+        # Determine model flavour for splitting reasoning chain
+        # 'oss' for gpt-oss, 'qwen' for Qwen3/QwQ/Deepseek (they all use <think>...</think>)
+        model_flavour = 'oss' if 'gpt-oss' in (row.model_path or "").lower() else 'qwen'
+        chunks = split_reasoning_chain(think, model_flavour=model_flavour)
+        if not chunks:
+            continue
+
+        if len(chunks) >= 40:
+            continue
+
+        predictions, continuation_texts, token_confidences, letter_probs = compute_predictions_per_prefix(
+            forcing,
+            prompt_text,
+            chunks,
+            system_prompt,
+            max_new_tokens,
+        )
+        metrics = compute_metrics(predictions, (row.correct_answer_letter or "").strip().upper() or None)
+
+        upsert_metrics(
+            conn,
+            source_table=source_table_name,
+            trace_id=row.id,
+            model_path=row.model_path,
+            model_name=forcing.model_name,
+            system_prompt=system_prompt,
+            num_chunks=len(chunks),
+            predictions=predictions,
+            continuation_texts=continuation_texts,
+            token_confidences=token_confidences,
+            letter_probs=letter_probs,
+            first_prediction_index=metrics["first_prediction_index"],
+            first_correct_index=metrics["first_correct_index"],
+            stabilized_index=metrics["stabilized_index"],
+            stabilized_value=metrics["stabilized_value"],
+            num_changes=metrics["num_changes"],
+            correct_at_first_chunk=metrics["correct_at_first_chunk"],
+            overall_correct=metrics["overall_correct"],
+        )
+
+    logger.info("Done.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(fire.Fire(run))
+
+
