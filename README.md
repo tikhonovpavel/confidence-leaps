@@ -120,15 +120,20 @@ Real output from
 
 This is a textbook **confidence leap**: the model commits to the wrong answer
 `A` for three chunks, then at chunk 3 — which literally opens with the trigger
-word *"Wait"* — it rechecks the algebra and `P(correct=B)` jumps from `0.32`
-to `0.98`, after which it stays certain. The probability trajectory:
+word *"Wait"* — it rechecks the algebra and `P(correct=B)` jumps from `0.318`
+to `0.985`, after which it stays certain. The probability trajectory:
 
 ```
-chunk:          0     1     2     3      4    5  …  21
-prediction:     A     A     A     B      B    B  …  B
-P(correct=B): 0.233 0.304 0.318 0.985  0.999 1.0 … 1.0
-                            └──── leap (Δ=0.667) ────┘
+chunk:          0     1     2     3     4     5     …     21
+prediction:     A     A     A     B     B     B     …     B
+P(correct=B):  .233  .304  .318  .985  .999  1.0    …    1.0
+                             ▲     ▲
+                          leap: .318 → .985  (Δ = +0.667, adjacent chunks 2→3)
 ```
+
+The leap is a change **between adjacent chunks**, `Δ = P_k(L) − P_{k-1}(L)`
+(same definition as in the paper); `max_jump` is the largest such single-step
+increase over the whole trace — here `k=3`, letter `B`.
 
 One `results.jsonl` record (the `reasoning_trace` / `chunks` text is abbreviated
 here with `…`; everything else is verbatim):
