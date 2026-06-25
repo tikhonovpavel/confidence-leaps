@@ -115,73 +115,85 @@ can't be processed are still recorded with a `status` (`no_think`, `no_chunks`,
 ## Example output
 
 Real output from
-`python extract_confidence_traces.py --model_name "Qwen/Qwen3-8B" --prompts_file example_tasks.jsonl --run_dir runs/example`.
+`python extract_confidence_traces.py --model_name "Qwen/Qwen3-8B" --dataset gpqa --limit 5 --max_prompt_tokens 16384 --max_chunks 60 --run_dir runs/gpqa`
+(a GPQA physics question — `⟨10σ_z + 5σ_x⟩` for a spin-½ superposition).
+
+This is a textbook **confidence leap**: the model commits to the wrong answer
+`A` for three chunks, then at chunk 3 — which literally opens with the trigger
+word *"Wait"* — it rechecks the algebra and `P(correct=B)` jumps from `0.32`
+to `0.98`, after which it stays certain. The probability trajectory:
+
+```
+chunk:          0     1     2     3      4    5  …  21
+prediction:     A     A     A     B      B    B  …  B
+P(correct=B): 0.233 0.304 0.318 0.985  0.999 1.0 … 1.0
+                            └──── leap (Δ=0.667) ────┘
+```
 
 One `results.jsonl` record (the `reasoning_trace` / `chunks` text is abbreviated
 here with `…`; everything else is verbatim):
 
 ```json
 {
-  "example_index": 0,
+  "example_index": 2,
   "status": "ok",
-  "prompt": "Find the root of the equation 2x + 6 = 0.\n\nChoices:\nA) -3\nB) 3\nC) -6\nD) 12",
-  "question": "Find the root of the equation 2x + 6 = 0.",
-  "choices": ["-3", "3", "-6", "12"],
-  "correct_letter": "A",
-  "natural_answer": "A",
-  "reasoning_trace": "Okay, so I need to solve the equation 2x + 6 = 0. Let me think …",
-  "chunks": ["Okay, so I need to solve the equation 2x + 6 = 0. Let me …", "Alternatively, maybe I can think of it as moving 6 to …"],
-  "num_chunks": 2,
-  "letter_probs": [
-    {"A": 1.0, "B": 1.05e-08, "C": 8.6e-10, "D": 8.6e-10},
-    {"A": 1.0, "B": 2.85e-08, "C": 3.0e-09, "D": 2.06e-09}
+  "question": "A spin-half particle is in a linear superposition 0.5|↑⟩ + (√3/2)|↓⟩ …",
+  "choices": ["…", "…", "…", "…"],
+  "correct_letter": "B",
+  "natural_answer": "B",
+  "reasoning_trace": "Okay, let's see. I need to find the expectation value of the operator 10σ_z + 5σ …",
+  "chunks": [
+    "…",
+    "But ⟨↑|↓⟩ is zero, and ⟨↓|↑⟩ is also zero. So the cross terms vanish. Therefore, ⟨σ_z⟩ = (0.25)(1) + ((3/4)(-1)) = 0.2…",
+    "Wait, let me check that again. Let me compute each term:\n\nFirst term: 0.5 * (√3)/2 * ⟨↑|↑⟩ = 0.5*(√3)/2 *1 = √3/4 ≈ 0.43…"
   ],
-  "per_chunk_prediction": ["A", "A"],
-  "per_chunk_top_confidence": [1.0, 1.0],
-  "per_chunk_correct_prob": [1.0, 1.0],
+  "num_chunks": 22,
+  "letter_probs": [
+    "…",
+    {"A": 0.3178, "B": 0.3178, "C": 0.2475, "D": 0.1169},
+    {"A": 0.0140, "B": 0.9846, "C": 0.0002, "D": 0.0012}
+  ],
+  "per_chunk_prediction": ["A", "A", "A", "B", "B", "B", "…", "B"],
+  "per_chunk_correct_prob": [0.233, 0.304, 0.318, 0.985, 0.999, 1.0, "…", 1.0],
   "max_confidence": 1.0,
-  "max_confidence_chunk": 0,
-  "min_confidence": 1.0,
-  "mean_confidence": 1.0,
-  "max_jump": {"chunk_index": 1, "letter": "B", "delta": 1.8e-08, "prob_before": 1.05e-08, "prob_after": 2.85e-08},
-  "max_drop": {"chunk_index": 1, "letter": "A", "delta": 0.0},
-  "max_correct_jump": {"chunk_index": 1, "delta": 0.0},
-  "final_prediction": "A",
+  "mean_confidence": 0.918,
+  "max_jump": {"chunk_index": 3, "letter": "B", "delta": 0.6668, "prob_before": 0.3178, "prob_after": 0.9846},
+  "max_correct_jump": {"chunk_index": 3, "delta": 0.6668},
+  "final_prediction": "B",
   "final_confidence": 1.0,
   "first_prediction_index": 0,
-  "first_correct_index": 0,
-  "stabilized_index": 0,
-  "stabilized_value": "A",
-  "num_changes": 0,
-  "correct_at_first_chunk": true,
+  "first_correct_index": 3,
+  "stabilized_index": 3,
+  "stabilized_value": "B",
+  "num_changes": 1,
+  "correct_at_first_chunk": false,
   "overall_correct": true,
   "leap_threshold": 0.5,
-  "leap_present": false,
-  "leap_stop_index": null,
-  "leap_predicted_letter": null,
-  "leap_correct": null
+  "leap_present": true,
+  "leap_stop_index": 3,
+  "leap_predicted_letter": "B",
+  "leap_correct": true
 }
 ```
 
-The matching `summary.json`:
+The matching `summary.json` for the 5-example run:
 
 ```json
 {
-  "num_examples": 3,
-  "status_counts": {"ok": 3},
-  "num_ok": 3,
-  "mean_num_chunks": 2.67,
-  "mean_max_confidence": 1.0,
-  "mean_max_jump": 2.8e-08,
-  "leap_present_rate": 0.0,
-  "natural_accuracy": 1.0,
-  "final_chunk_accuracy": 1.0
+  "num_examples": 5,
+  "status_counts": {"ok": 4, "too_many_chunks": 1},
+  "num_ok": 4,
+  "mean_num_chunks": 39.5,
+  "mean_max_confidence": 0.9996,
+  "mean_max_jump": 0.338,
+  "leap_present_rate": 0.25,
+  "natural_accuracy": 0.75,
+  "final_chunk_accuracy": 0.75
 }
 ```
 
-Note: these toy equations are easy, so the model is already certain at chunk 0
-(`P(A)=1.0` throughout) and there is **no** leap (`leap_present: false`,
-`max_jump.delta ≈ 0`). A confidence leap shows up on harder problems where the
-model first commits to a wrong answer and later revises — there
-`per_chunk_prediction` changes, `max_jump.delta` is large and positive, and
-`leap_present` becomes `true` at the chunk where the insight lands.
+Here `leap_stop_index: 3` means the early-stopping heuristic would have halted
+the chain at chunk 3 (out of 22) with the correct answer — the remaining 18
+chunks are spent only re-confirming a decision already made. One of the five
+examples was skipped (`too_many_chunks`) by the `--max_chunks 60` guard, and is
+still recorded in `results.jsonl` rather than dropped.
