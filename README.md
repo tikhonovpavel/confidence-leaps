@@ -111,3 +111,77 @@ Each `results.jsonl` record (`status == "ok"`) contains: `prompt`, `question`,
 `leap_present` / `leap_stop_index` / `leap_predicted_letter`, etc. Examples that
 can't be processed are still recorded with a `status` (`no_think`, `no_chunks`,
 `too_many_chunks`, `prompt_too_long`, `error`) so nothing is silently dropped.
+
+## Example output
+
+Real output from
+`python extract_confidence_traces.py --model_name "Qwen/Qwen3-8B" --prompts_file example_tasks.jsonl --run_dir runs/example`.
+
+One `results.jsonl` record (the `reasoning_trace` / `chunks` text is abbreviated
+here with `…`; everything else is verbatim):
+
+```json
+{
+  "example_index": 0,
+  "status": "ok",
+  "prompt": "Find the root of the equation 2x + 6 = 0.\n\nChoices:\nA) -3\nB) 3\nC) -6\nD) 12",
+  "question": "Find the root of the equation 2x + 6 = 0.",
+  "choices": ["-3", "3", "-6", "12"],
+  "correct_letter": "A",
+  "natural_answer": "A",
+  "reasoning_trace": "Okay, so I need to solve the equation 2x + 6 = 0. Let me think …",
+  "chunks": ["Okay, so I need to solve the equation 2x + 6 = 0. Let me …", "Alternatively, maybe I can think of it as moving 6 to …"],
+  "num_chunks": 2,
+  "letter_probs": [
+    {"A": 1.0, "B": 1.05e-08, "C": 8.6e-10, "D": 8.6e-10},
+    {"A": 1.0, "B": 2.85e-08, "C": 3.0e-09, "D": 2.06e-09}
+  ],
+  "per_chunk_prediction": ["A", "A"],
+  "per_chunk_top_confidence": [1.0, 1.0],
+  "per_chunk_correct_prob": [1.0, 1.0],
+  "max_confidence": 1.0,
+  "max_confidence_chunk": 0,
+  "min_confidence": 1.0,
+  "mean_confidence": 1.0,
+  "max_jump": {"chunk_index": 1, "letter": "B", "delta": 1.8e-08, "prob_before": 1.05e-08, "prob_after": 2.85e-08},
+  "max_drop": {"chunk_index": 1, "letter": "A", "delta": 0.0},
+  "max_correct_jump": {"chunk_index": 1, "delta": 0.0},
+  "final_prediction": "A",
+  "final_confidence": 1.0,
+  "first_prediction_index": 0,
+  "first_correct_index": 0,
+  "stabilized_index": 0,
+  "stabilized_value": "A",
+  "num_changes": 0,
+  "correct_at_first_chunk": true,
+  "overall_correct": true,
+  "leap_threshold": 0.5,
+  "leap_present": false,
+  "leap_stop_index": null,
+  "leap_predicted_letter": null,
+  "leap_correct": null
+}
+```
+
+The matching `summary.json`:
+
+```json
+{
+  "num_examples": 3,
+  "status_counts": {"ok": 3},
+  "num_ok": 3,
+  "mean_num_chunks": 2.67,
+  "mean_max_confidence": 1.0,
+  "mean_max_jump": 2.8e-08,
+  "leap_present_rate": 0.0,
+  "natural_accuracy": 1.0,
+  "final_chunk_accuracy": 1.0
+}
+```
+
+Note: these toy equations are easy, so the model is already certain at chunk 0
+(`P(A)=1.0` throughout) and there is **no** leap (`leap_present: false`,
+`max_jump.delta ≈ 0`). A confidence leap shows up on harder problems where the
+model first commits to a wrong answer and later revises — there
+`per_chunk_prediction` changes, `max_jump.delta` is large and positive, and
+`leap_present` becomes `true` at the chunk where the insight lands.
