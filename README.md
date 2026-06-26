@@ -118,22 +118,34 @@ Real output from
 `python extract_confidence_traces.py --model_name "Qwen/Qwen3-8B" --dataset gpqa --limit 5 --max_prompt_tokens 16384 --max_chunks 60 --run_dir runs/gpqa`
 (a GPQA physics question — `⟨10σ_z + 5σ_x⟩` for a spin-½ superposition).
 
-This example shows a **confidence leap**: the model commits to the wrong answer
-`A` for three chunks, then at chunk 3 — which opens with the trigger word
-*"Wait"* — it rechecks the algebra and `P(correct=B)` jumps from `0.318` to
-`0.985`, after which it stays certain. The probability trajectory:
+This example shows a **confidence leap**: the model's argmax prediction is the
+wrong answer `A` for three chunks, then at chunk 3 — which opens with the trigger
+word *"Wait"* — it rechecks the algebra and the probability of choice `B` jumps
+from `0.318` to `0.985`, after which it stays certain. Below, `P(B)` is the
+probability of the letter that leaps (`B`), which is selected **by the jump
+itself** — the heuristic does not know `B` is the correct answer:
 
 ```
-chunk:          0     1     2     3     4     5     …     21
-prediction:     A     A     A     B     B     B     …     B
-P(correct=B):  .233  .304  .318  .985  .999  1.0    …    1.0
-                             ▲     ▲
-                          leap: .318 → .985  (Δ = +0.667, adjacent chunks 2→3)
+chunk:        0     1     2     3     4     5     …     21
+argmax:       A     A     A     B     B     B     …     B
+P(B):        .233  .304  .318  .985  .999  1.0    …    1.0
+                           ▲     ▲
+                        leap: .318 → .985  (Δ = +0.667, adjacent chunks 2→3)
 ```
 
-The leap is a change **between adjacent chunks**, `Δ = P_k(L) − P_{k-1}(L)`
-(same definition as in the paper); `max_jump` is the largest such single-step
-increase over the whole trace — here `k=3`, letter `B`.
+The leap is a change **between adjacent chunks**, `Δ = P_k(L) − P_{k-1}(L)`,
+evaluated over **every** letter `L ∈ {A,B,C,D}` (same definition as in the
+paper). `max_jump` is the largest such single-step increase over the whole
+trace — here `k=3`, `L=B` — and the heuristic's predicted answer is the letter
+that leaped, with **no access to the ground-truth label**.
+
+> Decision fields (computed without the label): `letter_probs`, `max_jump`,
+> `max_drop`, `leap_present`, `leap_stop_index`, `leap_predicted_letter`,
+> `per_chunk_prediction`, `num_changes`, `stabilized_index`.
+> Diagnostic fields (need the label, used only to *score* the run afterwards,
+> like accuracy — never to decide when to stop): `per_chunk_correct_prob`,
+> `max_correct_jump`, `first_correct_index`, `leap_correct`, `overall_correct`,
+> `correct_at_first_chunk`.
 
 One `results.jsonl` record (the `reasoning_trace` / `chunks` text is abbreviated
 here with `…`; everything else is verbatim):
